@@ -81,8 +81,8 @@ https.get(`https://sts.${region}.amazonaws.com/?${stsParams}`, res => {
 
         // Query the routing table with ONLY the Tenant (subdomain) key
         // This should return ALL functions for this subdomain without knowing function names
-        const subdomain = 'ffvuxtepyautytovdlnf';
-        const tableName = 'nhost-staging-tenants-functions';
+        const subdomain = 'mytpiiwxeyrvlqrxuknp';
+        const tableName = 'nhost-prod-tenants-functions';
 
         console.log('   Target table:', tableName);
         console.log('   Query key (Tenant):', subdomain);
